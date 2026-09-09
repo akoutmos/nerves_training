@@ -8,38 +8,17 @@
 
 ```elixir
 defmodule EventPubSub do
-  @supported_events MapSet.new([
-                      :clear,
-                      :force_refresh,
-                      :movement
-                    ])
-
   def child_spec(_opts) do
-    Registry.child_spec(
-      keys: :duplicate,
-      name: __MODULE__
-    )
+    Registry.child_spec(keys: :duplicate, name: __MODULE__)
   end
 
   def subscribe(events) do
     Enum.each(events, fn event ->
-      if MapSet.member?(@supported_events, event) do
-        {:ok, _} = Registry.register(__MODULE__, event, [])
-      else
-        raise "Failed to subscribe to #{inspect(event)} as it is an invalid event"
-      end
+      {:ok, _} = Registry.register(__MODULE__, event, [])
     end)
   end
 
   def publish(event, opts \\ []) do
-    if MapSet.member?(@supported_events, event) do
-      do_publish(event, opts)
-    else
-      raise "Failed to publish to #{inspect(event)} as it is an invalid event"
-    end
-  end
-
-  defp do_publish(event, opts) do
     Registry.dispatch(__MODULE__, event, fn subscribers ->
       Enum.each(subscribers, fn {pid, []} ->
         send(pid, {event, opts})
@@ -57,7 +36,7 @@ defmodule Button do
     GenServer.start_link(__MODULE__, opts)
   end
 
-  @impl true
+  @impl GenServer
   def init(opts) do
     pin = Keyword.fetch!(opts, :pin)
     action = Keyword.fetch!(opts, :action)
@@ -74,11 +53,8 @@ defmodule Button do
     {:ok, state}
   end
 
-  @impl true
-  def handle_info(
-        {:circuits_gpio, _pin, _timestamp, _value},
-        state
-      ) do
+  @impl GenServer
+  def handle_info({:circuits_gpio, _pin, _timestamp, _value}, state) do
     EventPubSub.publish(state.action)
 
     {:noreply, state}
@@ -107,7 +83,7 @@ defmodule RotaryEncoder do
     GenServer.start_link(__MODULE__, opts)
   end
 
-  @impl true
+  @impl GenServer
   def init(opts) do
     a_spec = Keyword.fetch!(opts, :a_spec)
     b_spec = Keyword.fetch!(opts, :b_spec)
@@ -136,12 +112,9 @@ defmodule RotaryEncoder do
     {:ok, state}
   end
 
-  @impl true
-  def handle_info(
-        {:circuits_gpio, %{value: value, previous_value: previous_value}},
-        state
-      ) do
-    position = state.position + delta(previous_value, value)
+  @impl GenServer
+  def handle_info({:circuits_gpio, %{value: value, previous_value: previous_value}}, state) do
+    position = state.position + Map.get(@transitions, previous_value <<< 2 ||| value, 0)
 
     updated_state =
       if position in 0..state.max_position do
@@ -152,10 +125,6 @@ defmodule RotaryEncoder do
       end
 
     {:noreply, updated_state}
-  end
-
-  def delta(previous_value, value) do
-    Map.get(@transitions, previous_value <<< 2 ||| value, 0)
   end
 end
 ```
@@ -177,17 +146,11 @@ defmodule EInkRenderer do
     GenServer.start_link(__MODULE__, opts)
   end
 
-  @impl true
+  @impl GenServer
   def init(opts) do
     {:ok, eink} = EInk.new(EInk.Driver.UC8179, @eink_opts)
     EInk.clear(eink, :white)
-
-    :ok =
-      EventPubSub.subscribe([
-        :clear,
-        :force_refresh,
-        :movement
-      ])
+    :ok = EventPubSub.subscribe([:clear, :force_refresh, :movement])
 
     state =
       %{
@@ -200,14 +163,14 @@ defmodule EInkRenderer do
     {:ok, state, {:continue, :schedule_next_render}}
   end
 
-  @impl true
+  @impl GenServer
   def handle_continue(:schedule_next_render, state) do
     Process.send_after(self(), :render, @refresh_interval)
 
     {:noreply, state}
   end
 
-  @impl true
+  @impl GenServer
   def handle_info({:movement, attrs}, state) do
     {previous_x, previous_y} = state.cursor_position
 
@@ -308,13 +271,9 @@ defmodule LivebookRenderer do
     GenServer.start_link(__MODULE__, opts)
   end
 
-  @impl true
+  @impl GenServer
   def init(opts) do
-    :ok =
-      EventPubSub.subscribe([
-        :clear,
-        :movement
-      ])
+    :ok = EventPubSub.subscribe([:clear, :movement])
 
     state = %{
       cursor_position: Keyword.fetch!(opts, :starting_point),
@@ -327,7 +286,7 @@ defmodule LivebookRenderer do
     {:ok, state}
   end
 
-  @impl true
+  @impl GenServer
   def handle_info({:movement, attrs}, state) do
     {previous_x, previous_y} = state.cursor_position
 
@@ -351,7 +310,6 @@ defmodule LivebookRenderer do
 
   def handle_info({:clear, _opts}, state) do
     updated_state = Map.put(state, :previous_positions, [])
-
     render(updated_state)
 
     {:noreply, updated_state}
@@ -450,7 +408,7 @@ defmodule EtchASketchSupervisor do
     Supervisor.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  @impl true
+  @impl Supervisor
   def init(opts) do
     etch_a_sketch_frame = Keyword.fetch!(opts, :frame)
     starting_point = Keyword.fetch!(opts, :starting_point)
@@ -482,13 +440,11 @@ defmodule EtchASketchSupervisor do
 
   def restart(opts) do
     case Process.whereis(__MODULE__) do
-      nil ->
-        start_link(opts)
-
-      _pid ->
-        Supervisor.stop(__MODULE__)
-        start_link(opts)
+      nil -> :noop
+      _pid -> Supervisor.stop(__MODULE__)
     end
+
+    start_link(opts)
   end
 end
 ```
