@@ -213,9 +213,7 @@ defmodule StatPlotter do
     state = %{
       poll_interval: poll_interval,
       eink: eink,
-      measurement_ring_buffer: :queue.new(),
-      measurement_ring_buffer_length: 0,
-      measurement_ring_buffer_max_length: measurement_ring_buffer_max_length
+      measurement_ring_buffer: CircularBuffer.new(measurement_ring_buffer_max_length)
     }
 
     {:ok, state, {:continue, :schedule_next_run}}
@@ -247,24 +245,14 @@ defmodule StatPlotter do
         }
       end)
 
-    {measurement_ring_buffer_length, updated_measurement_ring_buffer} =
-      if state.measurement_ring_buffer_length >= state.measurement_ring_buffer_max_length do
-        {_value, queue} = :queue.out(state.measurement_ring_buffer)
+    updated_measurement_ring_buffer =
+      CircularBuffer.insert(state.measurement_ring_buffer, measurements)
 
-        {state.measurement_ring_buffer_max_length, :queue.in(measurements, queue)}
-      else
-        {state.measurement_ring_buffer_length + 1,
-         :queue.in(measurements, state.measurement_ring_buffer)}
-      end
-
-    updated_state =
-      state
-      |> Map.put(:measurement_ring_buffer_length, measurement_ring_buffer_length)
-      |> Map.put(:measurement_ring_buffer, updated_measurement_ring_buffer)
+    updated_state = Map.put(state, :measurement_ring_buffer, updated_measurement_ring_buffer)
 
     flattened_measurements =
       updated_measurement_ring_buffer
-      |> :queue.to_list()
+      |> CircularBuffer.to_list()
       |> List.flatten()
 
     image_bit_map = VegaLiteEInkRenderer.render(flattened_measurements)
