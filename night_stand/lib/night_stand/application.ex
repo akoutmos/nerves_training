@@ -7,6 +7,11 @@ defmodule NightStand.Application do
 
   @impl true
   def start(_type, _args) do
+    fonts_path =
+      :egd
+      |> :code.priv_dir()
+      |> Path.join("fonts")
+
     children =
       [
         {NightStand,
@@ -16,7 +21,7 @@ defmodule NightStand.Application do
          state: "Texas",
          timezone: "America/Chicago",
          panel_opts: [
-           font_path: "/root/livebook/elixir_conf_2026/files/Terminus22.wingsfont",
+           font_path: "#{fonts_path}/Terminus22.wingsfont",
            margins: {10, 10, 10, 10}
          ]}
       ]
