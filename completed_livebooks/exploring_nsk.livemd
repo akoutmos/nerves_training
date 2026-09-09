@@ -1,0 +1,42 @@
+# Exploring NSK
+
+## Introduction
+
+[<- Back to index](./index.livemd)
+
+## Using Toolshed Functions
+
+```elixir
+import Toolshed
+```
+
+```elixir
+# Get the current weather from wttr.in
+weather()
+```
+
+```elixir
+# List network interfaces
+ifconfig()
+```
+
+```elixir
+# List USB devices
+lsusb()
+```
+
+## Reading the Filesystem Directly
+
+```elixir
+"/proc/cpuinfo"
+|> File.read!() 
+|> IO.puts
+```
+
+```elixir
+File.ls!("/sys/class")
+```
+
+```elixir
+File.ls!("/dev")
+```

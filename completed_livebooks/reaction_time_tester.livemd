@@ -1,0 +1,279 @@
+# Reaction Time Tester
+
+## Introduction
+
+[<- Back to index](./index.livemd)
+
+## Section
+
+```elixir
+defmodule Button do
+  use GenServer
+
+  def start_link(opts) do
+    {name, rest_opts} = Keyword.pop!(opts, :name)
+
+    GenServer.start_link(__MODULE__, rest_opts, name: name)
+  end
+
+  def measure_reaction_time(name) do
+    GenServer.call(name, :measure_reaction_time, :infinity)
+  end
+
+  def set_alert_kino_frame(name, kino_frame) do
+    GenServer.call(name, {:set_alert_kino_frame, kino_frame})
+  end
+
+  @impl GenServer
+  def init(opts) do
+    gpio_pin = Keyword.fetch!(opts, :gpio_pin)
+
+    {:ok, button_gpio} = Circuits.GPIO.open(gpio_pin, :input, on_busy: :take_over)
+    :ok = Circuits.GPIO.set_pull_mode(button_gpio, :pullup)
+    :ok = Circuits.GPIO.set_interrupts(button_gpio, :falling)
+
+    state = %{
+      gpio_handler: button_gpio,
+      calling_process: nil,
+      start_time: nil,
+      alert_kino_frame: nil,
+      alert: Keyword.fetch!(opts, :alert)
+    }
+
+    {:ok, state}
+  end
+
+  @impl GenServer
+  def handle_call({:set_alert_kino_frame, kino_frame}, _from, state) do
+    disable_alert(kino_frame)
+
+    {:reply, :ok, Map.put(state, :alert_kino_frame, kino_frame)}
+  end
+
+  def handle_call(:measure_reaction_time, from, state) do
+    Process.send_after(self(), :start_measurement, Enum.random(2_000..7_000))
+
+    {:noreply, Map.put(state, :calling_process, from)}
+  end
+
+  @impl GenServer
+  def handle_info(:start_measurement, state) do
+    enable_alert(state.alert_kino_frame, state.alert)
+    start_time = System.monotonic_time(:millisecond)
+
+    {:noreply, Map.put(state, :start_time, start_time)}
+  end
+
+  def handle_info(
+        {:circuits_gpio, _pin, _timestamp, _value},
+        %{start_time: start_time, calling_process: calling_process} = state
+      )
+      when is_nil(start_time) or is_nil(calling_process) do
+    {:noreply, state}
+  end
+
+  def handle_info({:circuits_gpio, _pin, _timestamp, _value}, state) do
+    reaction_time_ms = System.monotonic_time(:millisecond) - state.start_time
+
+    GenServer.reply(state.calling_process, reaction_time_ms)
+
+    disable_alert(state.alert_kino_frame)
+
+    updated_state =
+      state
+      |> Map.put(:start_time, nil)
+      |> Map.put(:calling_process, nil)
+
+    {:noreply, updated_state}
+  end
+
+  defp disable_alert(kino_frame) do
+    content = Kino.Markdown.new("...")
+    Kino.Frame.render(kino_frame, content)
+  end
+
+  defp enable_alert(kino_frame, alert) do
+    content = Kino.Markdown.new("## #{alert}")
+    Kino.Frame.render(kino_frame, content)
+  end
+end
+```
+
+```elixir
+defmodule ReactionTimeGameSupervisor do
+  use Supervisor
+
+  def start_link do
+    Supervisor.start_link(__MODULE__, nil, name: __MODULE__)
+  end
+
+  @impl Supervisor
+  def init(_init_arg) do
+    children = [
+      Supervisor.child_spec(
+        {Button, gpio_pin: "PE5", name: :left_hand_button, alert: "PRESS LEFT BUTTON!"},
+        id: :left_hand_button
+      ),
+      Supervisor.child_spec(
+        {Button, gpio_pin: "PE11", name: :right_hand_button, alert: "PRESS RIGHT BUTTON!"},
+        id: :right_hand_button
+      )
+    ]
+
+    Supervisor.init(children, strategy: :one_for_all)
+  end
+end
+```
+
+```elixir
+defmodule GameController do
+  def create_chart do
+    [width: 650, height: 400]
+    |> VegaLite.new()
+    |> VegaLite.mark(:line, stroke_width: 2)
+    |> VegaLite.encode_field(
+      :x,
+      "x",
+      type: :nominal,
+      title: "Round"
+    )
+    |> VegaLite.encode_field(
+      :y,
+      "y",
+      type: :quantitative,
+      title: "Reaction time (in milliseconds)"
+    )
+    |> VegaLite.encode_field(:color, "hand", type: :nominal)
+    |> Kino.VegaLite.new()
+  end
+
+  def clear_chart(chart) do
+    Kino.VegaLite.clear(chart)
+  end
+
+  def pre_game_messaging(top_message_frame, bottom_message_frame) do
+    empty_text = Kino.Markdown.new("")
+    Kino.Frame.render(bottom_message_frame, empty_text)
+
+    5..1//-1
+    |> Enum.each(fn countdown ->
+      countdown_md =
+        Kino.Markdown.new("""
+        # Reaction time game will begin in #{countdown} seconds
+        """)
+
+      Kino.Frame.render(top_message_frame, countdown_md)
+      Process.sleep(1_000)
+    end)
+  end
+
+  def play_game(
+        rounds_to_play,
+        top_message_frame,
+        chart,
+        bottom_message_frame
+      ) do
+    {left_hand_results, right_hand_results} =
+      1..rounds_to_play
+      |> Enum.reduce(
+        {0, 0},
+        fn round, {left_hand_acc, right_hand_acc} ->
+          top_message_md = Kino.Markdown.new("# Round #{round}")
+          Kino.Frame.render(top_message_frame, top_message_md)
+
+          [left_hand_reaction_time, right_hand_reaction_time] =
+            [
+              :left_hand_button,
+              :right_hand_button
+            ]
+            |> Enum.map(fn hand ->
+              Task.async(fn ->
+                Button.measure_reaction_time(hand)
+              end)
+            end)
+            |> Task.await_many(:infinity)
+
+          Kino.VegaLite.push_many(chart, [
+            %{x: round, y: left_hand_reaction_time, hand: "Left"},
+            %{x: round, y: right_hand_reaction_time, hand: "Right"}
+          ])
+
+          {
+            left_hand_acc + left_hand_reaction_time,
+            right_hand_acc + right_hand_reaction_time
+          }
+        end
+      )
+
+    top_message_md = Kino.Markdown.new("# Reaction time test complete!")
+    Kino.Frame.render(top_message_frame, top_message_md)
+
+    results_md =
+      Kino.Markdown.new("""
+      ## Average reaction time results
+      * Left hand - #{round(left_hand_results / rounds_to_play)}ms
+      * Right hand - #{round(right_hand_results / rounds_to_play)}ms
+      """)
+
+    Kino.Frame.render(bottom_message_frame, results_md)
+  end
+
+  def restart_supervision_tree do
+    case Process.whereis(ReactionTimeGameSupervisor) do
+      nil -> :noop
+      _pid -> Supervisor.stop(ReactionTimeGameSupervisor)
+    end
+
+    ReactionTimeGameSupervisor.start_link()
+  end
+end
+```
+
+```elixir
+{:ok, pid} = GameController.restart_supervision_tree()
+Kino.Process.render_sup_tree(pid)
+```
+
+```elixir
+form =
+  Kino.Control.form(
+    [
+      total_rounds:
+        Kino.Input.range("Number of rounds to play",
+          default: 5,
+          min: 3,
+          max: 10,
+          step: 1
+        )
+    ],
+    submit: "Start reaction time test"
+  )
+
+top_message_frame = Kino.Frame.new()
+bottom_message_frame = Kino.Frame.new()
+chart = GameController.create_chart()
+
+Kino.listen(form, fn %{data: %{total_rounds: total_rounds}} ->
+  total_rounds = round(total_rounds)
+  Kino.VegaLite.clear(chart)
+  GameController.pre_game_messaging(top_message_frame, bottom_message_frame)
+
+  GameController.play_game(
+    total_rounds,
+    top_message_frame,
+    chart,
+    bottom_message_frame
+  )
+end)
+
+left_alert = Kino.Frame.new()
+right_alert = Kino.Frame.new()
+:ok = Button.set_alert_kino_frame(:left_hand_button, left_alert)
+:ok = Button.set_alert_kino_frame(:right_hand_button, right_alert)
+alter_grid = Kino.Layout.grid([left_alert, right_alert], columns: 2)
+
+Kino.Layout.grid(
+  [form, top_message_frame, alter_grid, chart, bottom_message_frame],
+  columns: 1
+)
+```

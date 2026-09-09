@@ -1,0 +1,503 @@
+# Etch A Sketch
+
+## Introduction
+
+[<- Back to index](./index.livemd)
+
+## Section
+
+```elixir
+defmodule EventPubSub do
+  @supported_events MapSet.new([
+                      :clear,
+                      :force_refresh,
+                      :movement
+                    ])
+
+  def child_spec(_opts) do
+    Registry.child_spec(
+      keys: :duplicate,
+      name: __MODULE__
+    )
+  end
+
+  def subscribe(events) do
+    Enum.each(events, fn event ->
+      if MapSet.member?(@supported_events, event) do
+        {:ok, _} = Registry.register(__MODULE__, event, [])
+      else
+        raise "Failed to subscribe to #{inspect(event)} as it is an invalid event"
+      end
+    end)
+  end
+
+  def publish(event, opts \\ []) do
+    if MapSet.member?(@supported_events, event) do
+      do_publish(event, opts)
+    else
+      raise "Failed to publish to #{inspect(event)} as it is an invalid event"
+    end
+  end
+
+  defp do_publish(event, opts) do
+    Registry.dispatch(__MODULE__, event, fn subscribers ->
+      Enum.each(subscribers, fn {pid, []} ->
+        send(pid, {event, opts})
+      end)
+    end)
+  end
+end
+```
+
+```elixir
+defmodule Button do
+  use GenServer
+
+  def start_link(opts) do
+    GenServer.start_link(__MODULE__, opts)
+  end
+
+  @impl true
+  def init(opts) do
+    pin = Keyword.fetch!(opts, :pin)
+    action = Keyword.fetch!(opts, :action)
+
+    {:ok, button_gpio} = Circuits.GPIO.open(pin, :input, on_busy: :take_over)
+    :ok = Circuits.GPIO.set_pull_mode(button_gpio, :pullup)
+    :ok = Circuits.GPIO.set_interrupts(button_gpio, :falling)
+
+    state = %{
+      button_gpio: button_gpio,
+      action: action
+    }
+
+    {:ok, state}
+  end
+
+  @impl true
+  def handle_info(
+        {:circuits_gpio, _pin, _timestamp, _value},
+        state
+      ) do
+    EventPubSub.publish(state.action)
+
+    {:noreply, state}
+  end
+end
+```
+
+```elixir
+defmodule RotaryEncoder do
+  use GenServer
+
+  import Bitwise
+
+  @transitions %{
+    0b0001 => +1,
+    0b0111 => +1,
+    0b1110 => +1,
+    0b1000 => +1,
+    0b0010 => -1,
+    0b0100 => -1,
+    0b1011 => -1,
+    0b1101 => -1
+  }
+
+  def start_link(opts) do
+    GenServer.start_link(__MODULE__, opts)
+  end
+
+  @impl true
+  def init(opts) do
+    a_spec = Keyword.fetch!(opts, :a_spec)
+    b_spec = Keyword.fetch!(opts, :b_spec)
+    max_position = Keyword.fetch!(opts, :max_position)
+    axis = Keyword.fetch!(opts, :axis)
+
+    {:ok, encoder} =
+      Circuits.GPIO.open([a_spec, b_spec], :input, pull_mode: :pullup, on_busy: :take_over)
+
+    {:ok, ref} = Circuits.GPIO.subscribe(encoder)
+
+    starting_position =
+      case {axis, Keyword.fetch!(opts, :starting_point)} do
+        {:x, {x, _y}} -> x
+        {:y, {_x, y}} -> y
+      end
+
+    state = %{
+      position: starting_position,
+      max_position: max_position,
+      axis: axis,
+      encoder: encoder,
+      ref: ref
+    }
+
+    {:ok, state}
+  end
+
+  @impl true
+  def handle_info(
+        {:circuits_gpio, %{value: value, previous_value: previous_value}},
+        state
+      ) do
+    position = state.position + delta(previous_value, value)
+
+    updated_state =
+      if position in 0..state.max_position do
+        EventPubSub.publish(:movement, %{axis: state.axis, position: position})
+        Map.put(state, :position, position)
+      else
+        state
+      end
+
+    {:noreply, updated_state}
+  end
+
+  def delta(previous_value, value) do
+    Map.get(@transitions, previous_value <<< 2 ||| value, 0)
+  end
+end
+```
+
+```elixir
+defmodule EInkRenderer do
+  use GenServer
+
+  @eink_opts [
+    dc_pin: "EPD_DC",
+    reset_pin: "EPD_RESET",
+    busy_pin: "EPD_BUSY",
+    spi_device: "spidev0.0"
+  ]
+
+  @refresh_interval 500
+
+  def start_link(opts) do
+    GenServer.start_link(__MODULE__, opts)
+  end
+
+  @impl true
+  def init(opts) do
+    {:ok, eink} = EInk.new(EInk.Driver.UC8179, @eink_opts)
+    EInk.clear(eink, :white)
+
+    :ok =
+      EventPubSub.subscribe([
+        :clear,
+        :force_refresh,
+        :movement
+      ])
+
+    state =
+      %{
+        cursor_position: Keyword.fetch!(opts, :starting_point),
+        cusor_position_last_render: nil,
+        previous_positions: %{},
+        eink: eink
+      }
+
+    {:ok, state, {:continue, :schedule_next_render}}
+  end
+
+  @impl true
+  def handle_continue(:schedule_next_render, state) do
+    Process.send_after(self(), :render, @refresh_interval)
+
+    {:noreply, state}
+  end
+
+  @impl true
+  def handle_info({:movement, attrs}, state) do
+    {previous_x, previous_y} = state.cursor_position
+
+    new_cursor_position =
+      case attrs.axis do
+        :x -> {attrs.position, previous_y}
+        :y -> {previous_x, attrs.position}
+      end
+
+    updated_state =
+      state
+      |> Map.put(:cursor_position, new_cursor_position)
+      |> Map.update!(:previous_positions, fn previous_positions ->
+        Map.update(
+          previous_positions,
+          previous_y,
+          MapSet.new([previous_x]),
+          fn existing_y_points ->
+            MapSet.put(existing_y_points, previous_x)
+          end
+        )
+      end)
+
+    {:noreply, updated_state}
+  end
+
+  def handle_info({:clear, _opts}, state) do
+    updated_state =
+      state
+      |> Map.put(:previous_positions, %{})
+      |> Map.put(:cusor_position_last_render, nil)
+
+    {:noreply, updated_state}
+  end
+
+  def handle_info({:force_refresh, _opts}, state) do
+    EInk.clear(state.eink, :white)
+
+    updated_state = Map.put(state, :cusor_position_last_render, nil)
+
+    {:noreply, updated_state}
+  end
+
+  def handle_info(:render, state) do
+    updated_state =
+      if state.cursor_position == state.cusor_position_last_render do
+        state
+      else
+        do_render(state)
+        Map.put(state, :cusor_position_last_render, state.cursor_position)
+      end
+
+    {:noreply, updated_state, {:continue, :schedule_next_render}}
+  end
+
+  defp do_render(state) do
+    {current_x, current_y} = state.cursor_position
+
+    enabled_bits =
+      Map.update(
+        state.previous_positions,
+        current_y,
+        MapSet.new([current_x]),
+        fn existing_y_points ->
+          MapSet.put(existing_y_points, current_x)
+        end
+      )
+
+    image_bit_map =
+      0..479
+      |> Enum.map(fn y ->
+        case enabled_bits do
+          %{^y => x_points} ->
+            for x <- 0..647, into: <<>> do
+              if MapSet.member?(x_points, x) do
+                <<0::1>>
+              else
+                <<1::1>>
+              end
+            end
+
+          _ ->
+            :binary.copy(<<0xFF>>, div(648, 8))
+        end
+      end)
+      |> IO.iodata_to_binary()
+
+    EInk.draw(state.eink, image_bit_map, refresh_type: :partial)
+  end
+end
+```
+
+```elixir
+defmodule LivebookRenderer do
+  use GenServer
+
+  def start_link(opts) do
+    GenServer.start_link(__MODULE__, opts)
+  end
+
+  @impl true
+  def init(opts) do
+    :ok =
+      EventPubSub.subscribe([
+        :clear,
+        :movement
+      ])
+
+    state = %{
+      cursor_position: Keyword.fetch!(opts, :starting_point),
+      previous_positions: [],
+      frame: Keyword.fetch!(opts, :frame)
+    }
+
+    render(state)
+
+    {:ok, state}
+  end
+
+  @impl true
+  def handle_info({:movement, attrs}, state) do
+    {previous_x, previous_y} = state.cursor_position
+
+    new_cursor_position =
+      case attrs.axis do
+        :x -> {attrs.position, previous_y}
+        :y -> {previous_x, attrs.position}
+      end
+
+    updated_state =
+      state
+      |> Map.put(:cursor_position, new_cursor_position)
+      |> Map.update!(:previous_positions, fn previous_positions ->
+        [{previous_x, previous_y} | previous_positions]
+      end)
+
+    render(updated_state)
+
+    {:noreply, updated_state}
+  end
+
+  def handle_info({:clear, _opts}, state) do
+    updated_state = Map.put(state, :previous_positions, [])
+
+    render(updated_state)
+
+    {:noreply, updated_state}
+  end
+
+  defp render(state) do
+    formatted_points =
+      state.previous_positions
+      |> List.insert_at(0, state.cursor_position)
+      |> Enum.map_join(" ", fn {x, y} ->
+        "#{x},#{y}"
+      end)
+
+    svg =
+      """
+      <svg
+        xmlns="http://www.w3.org/2000/svg"
+        width="888"
+        height="720"
+        viewBox="0 0 888 720"
+      >
+        <g stroke="none" stroke-width="1" fill="none" fill-rule="evenodd">
+          <g>
+            <rect
+              fill="#940B22"
+              x="0" y="0"
+              width="888" height="720"
+              rx="32"
+            />
+
+            <g transform="translate(120, 120)">
+              <rect fill="#C8D4C8" width="648" height="480"></rect>
+
+              <polyline
+                fill="none" 
+                stroke="black"
+                stroke-width="2"
+                points="#{formatted_points}"
+              />
+            </g>
+
+            <text font-size="64" font-weight="normal" fill="#DADADA">
+              <tspan x="260" y="76">Etch A Sketch</tspan>
+            </text>
+
+            <g
+              transform="
+                translate(120, 624)
+                rotate(#{calc_rotation(state.cursor_position, :x)}, 36, 36)
+              "
+            >
+              <circle
+                stroke="#979797" fill="#DADADA"
+                cx="36" cy="36"
+                r="36"
+              />
+              <circle fill="#505050" cx="36" cy="12" r="6" />
+            </g>
+
+            <g
+              transform="
+                translate(696, 624)
+                rotate(#{calc_rotation(state.cursor_position, :y)}, 36, 36)
+              "
+            >
+              <circle
+                stroke="#979797" fill="#DADADA"
+                cx="36" cy="36"
+                r="36"
+              />
+              <circle fill="#505050" cx="36" cy="12" r="6" />
+            </g>
+          </g>
+        </g>
+      </svg>
+      """
+      |> Kino.Image.new(:svg)
+
+    Kino.Frame.render(state.frame, svg)
+  end
+
+  defp calc_rotation({x_axis, y_axis}, axis) do
+    case axis do
+      :x -> -135 + x_axis / 648 * 270
+      :y -> -135 + y_axis / 480 * 270
+    end
+  end
+end
+```
+
+```elixir
+defmodule EtchASketchSupervisor do
+  use Supervisor
+
+  def start_link(opts) do
+    Supervisor.start_link(__MODULE__, opts, name: __MODULE__)
+  end
+
+  @impl true
+  def init(opts) do
+    etch_a_sketch_frame = Keyword.fetch!(opts, :frame)
+    starting_point = Keyword.fetch!(opts, :starting_point)
+
+    children = [
+      EventPubSub,
+      {EInkRenderer, starting_point: starting_point},
+      {LivebookRenderer, frame: etch_a_sketch_frame, starting_point: starting_point},
+      Supervisor.child_spec({Button, pin: "PE5", action: :clear}, id: :left_button),
+      Supervisor.child_spec({Button, pin: "PE11", action: :force_refresh}, id: :right_button),
+      Supervisor.child_spec(
+        {RotaryEncoder,
+         a_spec: "PE6", b_spec: "PE9", max_position: 648, axis: :x, starting_point: starting_point},
+        id: :right_encoder
+      ),
+      Supervisor.child_spec(
+        {RotaryEncoder,
+         a_spec: "PE13",
+         b_spec: "PE2",
+         max_position: 480,
+         axis: :y,
+         starting_point: starting_point},
+        id: :left_encoder
+      )
+    ]
+
+    Supervisor.init(children, strategy: :one_for_all)
+  end
+
+  def restart(opts) do
+    case Process.whereis(__MODULE__) do
+      nil ->
+        start_link(opts)
+
+      _pid ->
+        Supervisor.stop(__MODULE__)
+        start_link(opts)
+    end
+  end
+end
+```
+
+```elixir
+etch_a_sketch_frame = Kino.Frame.new()
+
+EtchASketchSupervisor.restart(frame: etch_a_sketch_frame, starting_point: {100, 100})
+sup_tree = Kino.Process.sup_tree(EtchASketchSupervisor, render_ets_tables: true)
+
+Kino.Layout.grid([sup_tree, etch_a_sketch_frame], columns: 1)
+```

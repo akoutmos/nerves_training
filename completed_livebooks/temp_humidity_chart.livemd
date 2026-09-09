@@ -1,0 +1,305 @@
+# Temp Humidity Monitor
+
+## Introduction
+
+[<- Back to index](./index.livemd)
+
+```elixir
+defmodule StatFetcher do
+  use GenServer
+
+  # Public functions
+
+  def start_link(opts) do
+    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+  end
+
+  def get(sensor) do
+    GenServer.call(__MODULE__, {:get, sensor})
+  end
+
+  # Callback functions
+
+  @impl true
+  def init(opts) do
+    {:ok, transport} = HTS221.Transport.init(HTS221.Transport.I2C, opts)
+    {:ok, %HTS221.Calibration{} = calibration} = HTS221.read_calibration(transport)
+
+    {:ok, {transport, calibration}}
+  end
+
+  @impl true
+  def handle_call({:get, :temperature}, _from, {transport, calibration} = state) do
+    {:ok, %HTS221.Temperature{} = temperature} = HTS221.read_temperature(transport)
+    calibrated_temp = HTS221.calculate_temperature(temperature, calibration)
+
+    {:reply, calibrated_temp, state}
+  end
+
+  def handle_call({:get, :humidity}, _from, {transport, calibration} = state) do
+    {:ok, %HTS221.Humidity{} = humidity} = HTS221.read_humidity(transport)
+    calibrated_humidity = HTS221.calculate_humidity(humidity, calibration)
+
+    {:reply, calibrated_humidity, state}
+  end
+end
+```
+
+```elixir
+defmodule PngToMono do
+  import Bitwise
+
+  @threshold 128
+
+  @doc """
+  Convert a PNG to a packed 1bpp buffer sized exactly for the panel.
+
+  Output is 1 = white, 0 = black, MSB = leftmost pixel.
+  """
+  def from_png(png, {cw, ch} = _canvas) when rem(cw, 8) == 0 do
+    img = StbImage.read_binary!(png)
+    {ih, iw, channels} = img.shape
+
+    scale = min(cw / iw, ch / ih)
+    w = iw |> Kernel.*(scale) |> round() |> clamp(1, cw)
+    h = ih |> Kernel.*(scale) |> round() |> clamp(1, ch)
+
+    img
+    |> StbImage.resize(h, w)
+    |> Map.fetch!(:data)
+    |> to_gray(channels)
+    |> center_on_white(w, h, cw, ch)
+    |> pack(<<>>)
+  end
+
+  defp clamp(v, lo, hi), do: v |> max(lo) |> min(hi)
+
+  # --- greyscale in one pass, specialised on channel count ---
+
+  defp to_gray(data, 1), do: data
+
+  defp to_gray(data, 2),
+    do: for(<<v, a <- data>>, into: <<>>, do: <<over_white(v, a)>>)
+
+  defp to_gray(data, 3),
+    do: for(<<r, g, b <- data>>, into: <<>>, do: <<luma(r, g, b)>>)
+
+  defp to_gray(data, 4),
+    do: for(<<r, g, b, a <- data>>, into: <<>>, do: <<over_white(luma(r, g, b), a)>>)
+
+  # Rec.601 in 8.8 fixed point: 77 + 151 + 28 == 256
+  defp luma(r, g, b), do: (r * 77 + g * 151 + b * 28) >>> 8
+
+  defp over_white(v, 255), do: v
+  defp over_white(v, a), do: (v * a + 255 * (255 - a) + 128) >>> 8
+
+  # --- centre on a white canvas of exactly cw x ch ---
+
+  defp center_on_white(gray, w, h, cw, ch) do
+    left = div(cw - w, 2)
+    top = div(ch - h, 2)
+
+    lpad = :binary.copy(<<255>>, left)
+    rpad = :binary.copy(<<255>>, cw - w - left)
+    blank = :binary.copy(<<255>>, cw)
+
+    body =
+      for <<row::binary-size(^w) <- gray>>, into: <<>> do
+        <<lpad::binary, row::binary, rpad::binary>>
+      end
+
+    :binary.copy(blank, top) <> body <> :binary.copy(blank, ch - h - top)
+  end
+
+  # --- 8 pixels -> 1 byte, MSB = leftmost ---
+
+  defp pack(<<>>, acc), do: acc
+
+  defp pack(<<a, b, c, d, e, f, g, h, rest::binary>>, acc) do
+    byte =
+      <<bit(a)::1, bit(b)::1, bit(c)::1, bit(d)::1, bit(e)::1, bit(f)::1, bit(g)::1, bit(h)::1>>
+
+    pack(rest, <<acc::binary, byte::binary>>)
+  end
+
+  defp bit(v) when v >= @threshold, do: 1
+  defp bit(_), do: 0
+end
+```
+
+```elixir
+defmodule VegaLiteEInkRenderer do
+  def render(time_series_data) do
+    encoded_vega_lite_chart =
+      [
+        width: 600,
+        height: 400,
+        title: "Nerves Starter Kit Weather Monitor"
+      ]
+      |> VegaLite.new()
+      |> VegaLite.config(
+        title: [font_size: 24],
+        axis: [
+          title_font_size: 20,
+          label_font_size: 18,
+          grid: false
+        ],
+        legend: [
+          symbol_type: "stroke",
+          symbol_stroke_width: 4,
+          symbol_size: 300,
+          title_font_size: 18,
+          label_font_size: 16
+        ]
+      )
+      |> VegaLite.data_from_values(time_series_data)
+      |> VegaLite.mark(:line, stroke_width: 4)
+      |> VegaLite.encode_field(:x, "timestamp",
+        type: :temporal,
+        title: "Time",
+        axis: [
+          format: "%H:%M",
+          title: "Time",
+          label_angle: -45
+        ]
+      )
+      |> VegaLite.encode_field(:y, "value",
+        type: :quantitative,
+        title: "Value"
+      )
+      |> VegaLite.encode_field(:stroke_dash, "type", type: :nominal)
+      |> VegaLite.to_spec()
+      |> JSON.encode!()
+      |> :zlib.compress()
+      |> Base.url_encode64()
+
+    "https://kroki.io/vegalite/png/#{encoded_vega_lite_chart}"
+    |> Req.get!()
+    |> Map.fetch!(:body)
+    |> PngToMono.from_png({648, 480})
+  end
+end
+```
+
+```elixir
+defmodule StatPlotter do
+  use GenServer
+
+  @default_eink_opts [
+    dc_pin: "EPD_DC",
+    reset_pin: "EPD_RESET",
+    busy_pin: "EPD_BUSY",
+    spi_device: "spidev0.0"
+  ]
+
+  # Public functions
+
+  def start_link(opts) do
+    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+  end
+
+  # Callback functions
+
+  @impl true
+  def init(opts) do
+    {poll_interval, rest_opts} = Keyword.pop(opts, :poll_interval, 10_000)
+
+    {measurement_ring_buffer_max_length, eink_opts} =
+      Keyword.pop(rest_opts, :measurement_ring_buffer_max_length, 20)
+
+    eink_opts = Keyword.merge(@default_eink_opts, eink_opts)
+    {:ok, eink} = EInk.new(EInk.Driver.UC8179, eink_opts)
+
+    state = %{
+      poll_interval: poll_interval,
+      eink: eink,
+      measurement_ring_buffer: :queue.new(),
+      measurement_ring_buffer_length: 0,
+      measurement_ring_buffer_max_length: measurement_ring_buffer_max_length
+    }
+
+    {:ok, state, {:continue, :schedule_next_run}}
+  end
+
+  @impl true
+  def handle_continue(:schedule_next_run, %{poll_interval: poll_interval} = state) do
+    Process.send_after(self(), :perform_cron_work, poll_interval)
+
+    {:noreply, state}
+  end
+
+  @impl true
+  def handle_info(:perform_cron_work, state) do
+    timestamp = NaiveDateTime.utc_now()
+
+    measurements =
+      Enum.map([:temperature, :humidity], fn sensor ->
+        value =
+          sensor
+          |> StatFetcher.get()
+          |> Decimal.from_float()
+          |> Decimal.round(2)
+
+        %{
+          type: sensor |> Atom.to_string() |> String.capitalize(),
+          value: value,
+          timestamp: timestamp
+        }
+      end)
+
+    {measurement_ring_buffer_length, updated_measurement_ring_buffer} =
+      if state.measurement_ring_buffer_length >= state.measurement_ring_buffer_max_length do
+        {_value, queue} = :queue.out(state.measurement_ring_buffer)
+
+        {state.measurement_ring_buffer_max_length, :queue.in(measurements, queue)}
+      else
+        {state.measurement_ring_buffer_length + 1,
+         :queue.in(measurements, state.measurement_ring_buffer)}
+      end
+
+    updated_state =
+      state
+      |> Map.put(:measurement_ring_buffer_length, measurement_ring_buffer_length)
+      |> Map.put(:measurement_ring_buffer, updated_measurement_ring_buffer)
+
+    flattened_measurements =
+      updated_measurement_ring_buffer
+      |> :queue.to_list()
+      |> List.flatten()
+
+    image_bit_map = VegaLiteEInkRenderer.render(flattened_measurements)
+    EInk.clear(updated_state.eink, :white)
+    EInk.draw(state.eink, image_bit_map)
+
+    {:noreply, updated_state, {:continue, :schedule_next_run}}
+  end
+end
+```
+
+```elixir
+defmodule TempMonitor do
+  use Supervisor
+
+  @bus_opts [bus_name: "i2c-0"]
+
+  def start_link(opts) do
+    Supervisor.start_link(__MODULE__, opts, name: __MODULE__)
+  end
+
+  @impl true
+  def init(_opts) do
+    children = [
+      {HTS221.Server, transport: {HTS221.Transport.I2C, @bus_opts}},
+      {StatFetcher, @bus_opts},
+      StatPlotter
+    ]
+
+    Supervisor.init(children, strategy: :one_for_one)
+  end
+end
+```
+
+```elixir
+{:ok, pid} = TempMonitor.start_link([])
+Kino.Process.render_sup_tree(pid)
+```

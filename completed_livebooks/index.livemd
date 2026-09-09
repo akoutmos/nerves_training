@@ -1,0 +1,10 @@
+# Elixir Conf 2026 Nerves Training
+
+## Projects
+
+* [Exploring NSK](exploring_nsk.livemd)
+* [Simple EInk "Hello World"](simple_hello_world.livemd)
+* [Animating EInk Printing](dynamic_hello_world.livemd)
+* [Plotting Temperature and Humidity with VegaLite](temp_humidity_chart.livemd)
+* [Reaction Time Tester](reaction_time_tester.livemd)
+* [Building an Etch A Sketch](etch_a_sketch.livemd)

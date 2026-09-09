@@ -1,0 +1,73 @@
+<!-- livebook:{"file_entries":[{"name":"Terminus16.wingsfont","type":"attachment"},{"name":"Terminus22.wingsfont","type":"attachment"}]} -->
+
+# Simple Hello World
+
+## Introduction
+
+[<- Back to index](./index.livemd)
+
+## Simple Printing
+
+```elixir
+defmodule Demo do
+  @behaviour EgdTextPanel.Renderer
+
+  def run do
+    close_gpios()
+
+    eink_opts = [
+      dc_pin: "EPD_DC",
+      reset_pin: "EPD_RESET",
+      busy_pin: "EPD_BUSY",
+      spi_device: "spidev0.0"
+    ]
+
+    {:ok, eink} = EInk.new(EInk.Driver.UC8179, eink_opts)
+
+    {:ok, panel} =
+      EgdTextPanel.start_link(
+        renderer: __MODULE__,
+        renderer_state: %{eink: eink},
+        width: 648,
+        height: 480
+      )
+
+    IO.puts(panel, "Hello world!!!!!!")
+  end
+
+  def close_gpios do
+    Enum.each(["EPD_DC", "EPD_RESET", "EPD_BUSY"], fn gpio ->
+      Circuits.GPIO.force_close(gpio)
+    end)
+  end
+
+  @impl EgdTextPanel.Renderer
+  def draw_background(_image, state) do
+    state
+  end
+
+  @impl EgdTextPanel.Renderer
+  def render_image(image, state) do
+    rgb = :egd.render(image, :raw_bitmap)
+    data = pack_bits(rgb)
+    EInk.draw(state.eink, data, refresh_type: :full)
+
+    state
+  end
+
+  defp pack_bits(binary) do
+    # Convert 24-bit RGB to 1 bpp. This samples the high bit of the red
+    # component. A more sophisticated conversion would convert to gray and
+    # dither, but the example source image is black and white anyway.
+    for <<b0::1, _::23, b1::1, _::23, b2::1, _::23, b3::1, _::23, b4::1, _::23, b5::1, _::23,
+          b6::1, _::23, b7::1, _::23 <- binary>>,
+        into: <<>> do
+      <<b0::1, b1::1, b2::1, b3::1, b4::1, b5::1, b6::1, b7::1>>
+    end
+  end
+end
+```
+
+```elixir
+Demo.run()
+```

@@ -1,0 +1,160 @@
+<!-- livebook:{"file_entries":[{"name":"Terminus16.wingsfont","type":"attachment"},{"name":"Terminus22.wingsfont","type":"attachment"}]} -->
+
+# Animated Hello World
+
+## Introduction
+
+[<- Back to index](./index.livemd)
+
+## Animated Printing
+
+```elixir
+defmodule PrintServer do
+  use GenServer
+
+  @behaviour EgdTextPanel.Renderer
+
+  @default_eink_opts [
+    dc_pin: "EPD_DC",
+    reset_pin: "EPD_RESET",
+    busy_pin: "EPD_BUSY",
+    spi_device: "spidev0.0"
+  ]
+
+  @default_panel_opts [
+    renderer: __MODULE__,
+    width: 648,
+    height: 480
+  ]
+
+  # Public API functions
+
+  def start_link(opts) do
+    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+  end
+
+  def print(string) do
+    GenServer.call(__MODULE__, {:print, :puts, string})
+  end
+
+  def animate(string) do
+    string
+    |> String.split(" ")
+    |> Enum.each(fn word ->
+      GenServer.call(__MODULE__, {:print, :write, word <> " "})
+    end)
+  end
+
+  def restart(opts) do
+    PrintServer
+    |> Process.whereis()
+    |> case do
+      pid when is_pid(pid) -> GenServer.stop(pid)
+      _ -> :noop
+    end
+
+    start_link(opts)
+  end
+
+  # GenServer Callback functions
+
+  @impl GenServer
+  def init(opts) do
+    eink_opts = get_and_merge_defaults(opts, :eink_opts, @default_eink_opts)
+    panel_opts = get_and_merge_defaults(opts, :panel_opts, @default_panel_opts)
+
+    # Ensure there are no dangling handlers to GPIO pins
+    close_gpios()
+
+    # Create a SPI handler for the EInk display
+    {:ok, eink} = EInk.new(EInk.Driver.UC8179, eink_opts)
+
+    # Create an EdgTextPanel to print text to
+    render_state = {:renderer_state, %{eink: eink, render_count: 0}}
+    {:ok, panel} = EgdTextPanel.start_link([render_state | panel_opts])
+
+    {:ok, %{eink: eink, panel: panel}}
+  end
+
+  @impl GenServer
+  def handle_call({:print, mode, string}, _from, %{panel: panel} = state) do
+    case mode do
+      :write -> IO.write(panel, string)
+      :puts -> IO.puts(panel, string)
+    end
+
+    Process.sleep(500)
+
+    {:reply, :ok, state}
+  end
+
+  # EgdTextPanel Callback functions
+
+  @impl EgdTextPanel.Renderer
+  def draw_background(_image, state) do
+    state
+  end
+
+  @impl EgdTextPanel.Renderer
+  def render_image(image, state) do
+    refresh_type = if rem(state.render_count, 20) == 0, do: :full, else: :partial
+
+    rgb = :egd.render(image, :raw_bitmap)
+    data = pack_bits(rgb)
+    EInk.draw(state.eink, data, refresh_type: refresh_type)
+
+    Map.update!(state, :render_count, fn render_count ->
+      render_count + 1
+    end)
+  end
+
+  # Helper functions
+
+  defp get_and_merge_defaults(full_opts, key, defaults) do
+    opts = Keyword.get(full_opts, key, [])
+    Keyword.merge(defaults, opts)
+  end
+
+  defp close_gpios do
+    Enum.each(["EPD_DC", "EPD_RESET", "EPD_BUSY"], fn gpio ->
+      Circuits.GPIO.force_close(gpio)
+    end)
+  end
+
+  defp pack_bits(binary) do
+    # Convert 24-bit RGB to 1 bpp. This samples the high bit of the red
+    # component. A more sophisticated conversion would convert to gray and
+    # dither, but the example source image is black and white anyway.
+    for <<b0::1, _::23, b1::1, _::23, b2::1, _::23, b3::1, _::23, b4::1, _::23, b5::1, _::23,
+          b6::1, _::23, b7::1, _::23 <- binary>>,
+        into: <<>> do
+      <<b0::1, b1::1, b2::1, b3::1, b4::1, b5::1, b6::1, b7::1>>
+    end
+  end
+end
+```
+
+```elixir
+fonts_path =
+  :egd
+  |> :code.priv_dir()
+  |> Path.join("fonts")
+  |> IO.inspect()
+
+File.ls!(fonts_path)
+```
+
+```elixir
+PrintServer.restart(
+  panel_opts: [
+    font_path: "#{fonts_path}/Terminus22.wingsfont", 
+    margins: {10, 10, 10, 10}
+  ]
+)
+```
+
+```elixir
+PrintServer.animate("Hello ElixirConf 2026!")
+PrintServer.print("\n")
+PrintServer.animate("The Nerves Training will be lots of fun!")
+```
