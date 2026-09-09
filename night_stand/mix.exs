@@ -40,7 +40,7 @@ defmodule NightStand.MixProject do
       {:shoehorn, "~> 0.9.1"},
       {:ring_logger, "~> 0.11.0"},
       {:toolshed, "~> 0.5.0"},
-      {:tz, "~> 0.28"},
+      {:nerves_time_zones, "~> 0.3.9"},
 
       # Allow Nerves.Runtime on host to support development, testing and CI.
       # See config/host.exs for usage.
